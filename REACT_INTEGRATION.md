@@ -1,8 +1,10 @@
-[# SmartApply — React Frontend Integration Guide
+# SmartApply — React Frontend Integration Guide
 
 > **For the React / frontend developer.**
-> This document covers every API endpoint, exact request and response shapes verified directly from the source code, the toggle-button pipeline flow, job card display logic, error handling patterns, and environment setup.
+> This document covers every API endpoint, exact request and response shapes verified directly from the source code, the toggle-button pipeline flow, dashboard job list, job detail, resume download, error handling patterns, and environment setup.
 > The backend is already live. **React only talks to Django — never directly to FastAPI.**
+>
+> **Last updated: 2026-04-18** — Added Toggle API, Dashboard API (job list + job detail + resume download).
 
 ---
 
@@ -30,19 +32,30 @@
    - [4.7 Certifications](#47-certifications)
    - [4.8 Achievements](#48-achievements)
    - [4.9 Get Full Resume (Aggregate)](#49-get-full-resume-aggregate)
-5. [SmartApply Pipeline — The Toggle Button](#5-smartapply-pipeline--the-toggle-button)
-   - [5.1 How It Works](#51-how-it-works)
-   - [5.2 Trigger the Full Pipeline](#52-trigger-the-full-pipeline)
-   - [5.3 Full Response Shape](#53-full-response-shape)
-   - [5.4 What to Display Per Job Card](#54-what-to-display-per-job-card)
-   - [5.5 Resume Download](#55-resume-download)
-6. [My Applications — Load Saved Results](#6-my-applications--load-saved-results)
-7. [Discover Jobs Only (Agent 1)](#7-discover-jobs-only-agent-1)
-8. [Agents Health Check](#8-agents-health-check)
-9. [Error Handling](#9-error-handling)
-10. [Auth UI Flow Diagrams](#10-auth-ui-flow-diagrams)
-11. [Quick Reference — All Endpoints](#11-quick-reference--all-endpoints)
-12. [Important Notes for the React Developer](#12-important-notes-for-the-react-developer)
+5. [Toggle API — SmartApply ON/OFF](#5-toggle-api--smartapply-onoff) ⬅ NEW
+   - [5.1 How the Toggle Works](#51-how-the-toggle-works)
+   - [5.2 GET Toggle State](#52-get-toggle-state)
+   - [5.3 POST Toggle ON](#53-post-toggle-on)
+   - [5.4 POST Toggle OFF](#54-post-toggle-off)
+   - [5.5 GET Toggle Status (free tier)](#55-get-toggle-status-free-tier)
+   - [5.6 Full React Toggle Component Example](#56-full-react-toggle-component-example)
+6. [Dashboard API — Jobs Found](#6-dashboard-api--jobs-found) ⬅ NEW
+   - [6.1 List All Jobs](#61-list-all-jobs)
+   - [6.2 Job Detail](#62-job-detail)
+   - [6.3 Download Resume PDF](#63-download-resume-pdf)
+   - [6.4 What to Display Per Job Card](#64-what-to-display-per-job-card)
+   - [6.5 Full Dashboard React Example](#65-full-dashboard-react-example)
+7. [SmartApply Pipeline (Legacy Direct Trigger)](#7-smartapply-pipeline-legacy-direct-trigger)
+   - [7.1 How It Works](#71-how-it-works)
+   - [7.2 Trigger the Full Pipeline](#72-trigger-the-full-pipeline)
+   - [7.3 Full Response Shape](#73-full-response-shape)
+8. [My Applications — Load Saved Results](#8-my-applications--load-saved-results)
+9. [Discover Jobs Only (Agent 1)](#9-discover-jobs-only-agent-1)
+10. [Agents Health Check](#10-agents-health-check)
+11. [Error Handling](#11-error-handling)
+12. [Auth UI Flow Diagrams](#12-auth-ui-flow-diagrams)
+13. [Quick Reference — All Endpoints](#13-quick-reference--all-endpoints)
+14. [Important Notes for the React Developer](#14-important-notes-for-the-react-developer)
 
 ---
 
@@ -1147,9 +1160,717 @@ const resume = await res.json();
 
 ---
 
-## 5. SmartApply Pipeline — The Toggle Button
+## 5. Toggle API — SmartApply ON/OFF
 
-### 5.1 How It Works
+> **This is the primary way React controls the pipeline.** The toggle stores state in Django's database and fires the AI pipeline immediately when turned ON.
+
+### 5.1 How the Toggle Works
+
+```
+User presses toggle ON
+        │
+        ▼
+POST /api/agents/toggle/  {"enabled": true}
+        │
+        │  Django saves is_enabled=True + last_triggered_at=now
+        │  Django calls FastAPI /api/v1/smart-apply (synchronous HTTP)
+        │  Pipeline runs: Discovery → Enrichment → Scoring → Resume Generation
+        │  (~30 seconds to 5 minutes depending on new jobs found)
+        │
+        ▼
+Response: {is_enabled: true, message: "Pipeline completed.", result: {...}}
+        │
+        ▼
+Use result.jobs_to_apply + result.jobs_to_notify to populate dashboard
+OR call GET /api/agents/dashboard/jobs/ to load jobs at any time
+
+User presses toggle OFF
+        │
+        ▼
+POST /api/agents/toggle/  {"enabled": false}
+        │
+        │  Django saves is_enabled=False
+        │  No more pipeline runs
+        │
+        ▼
+Response: {is_enabled: false, message: "SmartApply disabled."}
+```
+
+**Key points:**
+- Toggle state persists in the database — survives page refresh
+- Turning ON fires the pipeline immediately and waits for it to complete
+- The pipeline result is returned directly in the toggle ON response
+- Use `GET /api/agents/toggle/` on page load to restore the toggle's visual state
+- After the pipeline runs, use `GET /api/agents/dashboard/jobs/` to reload jobs any time
+
+---
+
+### 5.2 GET Toggle State
+
+**`GET /api/agents/toggle/`** — Requires JWT.
+
+Call this when the page loads to restore the toggle's visual state.
+
+```js
+const res = await apiFetch("/api/agents/toggle/");
+const data = await res.json();
+```
+
+**Success — HTTP 200:**
+```json
+{
+  "is_enabled": false,
+  "last_triggered_at": "2026-04-18T10:07:36.807873Z",
+  "task_id": null
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `is_enabled` | boolean | Current toggle state — use to set toggle UI on page load |
+| `last_triggered_at` | string or null | ISO 8601 timestamp of last pipeline run. Show as "Last run: X ago" |
+| `task_id` | string or null | Always `null` on free tier. Will be a UUID on AWS. |
+
+---
+
+### 5.3 POST Toggle ON
+
+**`POST /api/agents/toggle/`** — Requires JWT. **Set timeout to 10 minutes.**
+
+This call **blocks until the pipeline completes** (~30 seconds–5 minutes). Show a loading UI immediately after the user presses the toggle.
+
+**Request body:**
+```json
+{ "enabled": true }
+```
+
+```js
+const res = await fetch(`${BASE}/api/agents/toggle/`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${localStorage.getItem("access_token")}`,
+  },
+  body: JSON.stringify({ enabled: true }),
+  signal: AbortSignal.timeout(600_000), // 10 minute timeout
+});
+const data = await res.json();
+```
+
+**Success — HTTP 200 (free tier):**
+```json
+{
+  "is_enabled": true,
+  "message": "SmartApply enabled. Pipeline completed.",
+  "result": {
+    "success": true,
+    "user_id": "6",
+    "total_jobs_found": 8,
+    "jobs_to_apply": [...],
+    "jobs_to_notify": [...],
+    "execution_time_ms": 39000,
+    "agent_logs": [...]
+  }
+}
+```
+
+> **`result` contains the full pipeline output** — same shape as Section 7.3. Use `result.jobs_to_apply` and `result.jobs_to_notify` directly OR call `GET /api/agents/dashboard/jobs/` afterward for the persistent list.
+
+**Error — HTTP 503** (FastAPI agents service down):
+```json
+{
+  "error": "Pipeline failed. Agents service may be unavailable."
+}
+```
+
+**Error — HTTP 400** (missing field):
+```json
+{
+  "error": "'enabled' field is required (true or false)"
+}
+```
+
+---
+
+### 5.4 POST Toggle OFF
+
+**`POST /api/agents/toggle/`** — Requires JWT.
+
+**Request body:**
+```json
+{ "enabled": false }
+```
+
+```js
+const res = await apiFetch("/api/agents/toggle/", {
+  method: "POST",
+  body: JSON.stringify({ enabled: false }),
+});
+const data = await res.json();
+```
+
+**Success — HTTP 200:**
+```json
+{
+  "is_enabled": false,
+  "message": "SmartApply disabled. Scheduled runs stopped."
+}
+```
+
+---
+
+### 5.5 GET Toggle Status (free tier)
+
+**`GET /api/agents/toggle/status/?task_id=<id>`** — Requires JWT.
+
+On free tier this always returns `not_applicable` because the pipeline runs synchronously (result is already in the toggle ON response). On AWS this will return real Celery task status.
+
+```js
+// Free tier — always returns:
+{
+  "status": "not_applicable",
+  "message": "Async task polling is not available on free tier. Pipeline runs synchronously."
+}
+
+// AWS (future) — will return:
+{ "task_id": "uuid", "status": "pending" | "running" | "success" | "failed", "result": {...} }
+```
+
+**How to handle both in React (write once, works on both):**
+
+```js
+async function handleToggleOn() {
+  const res = await apiFetch("/api/agents/toggle/", {
+    method: "POST",
+    body: JSON.stringify({ enabled: true }),
+  });
+  const data = await res.json();
+
+  if (data.task_id) {
+    // AWS mode — poll for completion
+    pollTaskStatus(data.task_id);
+  } else if (data.result) {
+    // Free tier mode — already done, use result directly
+    setJobResults(data.result);
+    setPipelineStatus("done");
+  }
+}
+```
+
+---
+
+### 5.6 Full React Toggle Component Example
+
+```jsx
+import { useState, useEffect } from "react";
+import { apiFetch } from "../api/client";
+
+export function SmartApplyToggle({ onJobsReady }) {
+  const [isEnabled, setIsEnabled]       = useState(false);
+  const [lastRun, setLastRun]           = useState(null);
+  const [status, setStatus]             = useState("idle");
+  // "idle" | "loading" | "running" | "done" | "error"
+
+  // Restore toggle state on page load
+  useEffect(() => {
+    apiFetch("/api/agents/toggle/")
+      .then(r => r.json())
+      .then(d => {
+        setIsEnabled(d.is_enabled);
+        setLastRun(d.last_triggered_at);
+      });
+  }, []);
+
+  async function handleToggle(newValue) {
+    if (newValue) {
+      setIsEnabled(true);
+      setStatus("running");
+
+      try {
+        const res = await fetch(`${import.meta.env.VITE_API_BASE_URL}/api/agents/toggle/`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${localStorage.getItem("access_token")}`,
+          },
+          body: JSON.stringify({ enabled: true }),
+          signal: AbortSignal.timeout(600_000),
+        });
+
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || "Pipeline failed");
+        }
+
+        const data = await res.json();
+        setLastRun(new Date().toISOString());
+        setStatus("done");
+
+        // Pass results up to parent
+        if (data.result) {
+          onJobsReady(data.result);
+        }
+
+      } catch (err) {
+        setIsEnabled(false);
+        setStatus("error");
+        console.error("Toggle ON failed:", err.message);
+      }
+
+    } else {
+      setIsEnabled(false);
+      setStatus("idle");
+      await apiFetch("/api/agents/toggle/", {
+        method: "POST",
+        body: JSON.stringify({ enabled: false }),
+      });
+    }
+  }
+
+  return (
+    <div>
+      <label>
+        SmartApply
+        <input
+          type="checkbox"
+          checked={isEnabled}
+          disabled={status === "running"}
+          onChange={e => handleToggle(e.target.checked)}
+        />
+      </label>
+
+      {status === "running" && <p>Running pipeline... (~1-5 min)</p>}
+      {status === "done"    && <p>Done! Jobs updated.</p>}
+      {status === "error"   && <p>Something went wrong. Try again.</p>}
+      {lastRun && <p>Last run: {new Date(lastRun).toLocaleString()}</p>}
+    </div>
+  );
+}
+```
+
+---
+
+## 6. Dashboard API — Jobs Found
+
+> **Use this to show the user's job results any time** — on page load, after navigation, after the pipeline runs. Jobs persist in the database so they survive page refresh.
+
+### 6.1 List All Jobs
+
+**`GET /api/agents/dashboard/jobs/`** — Requires JWT.
+
+Returns all jobs found across all pipeline runs for the authenticated user — auto_apply, notify, AND rejected. Sorted by discovered date descending.
+
+```js
+const res = await apiFetch("/api/agents/dashboard/jobs/");
+const data = await res.json();
+// data.count  — total number of jobs
+// data.jobs   — array of job summaries
+```
+
+**Success — HTTP 200:**
+```json
+{
+  "count": 8,
+  "jobs": [
+    {
+      "job_id": "459f578a8bec3e742837e253d6a03cbc",
+      "title": "1317 Python Developer jobs in the US",
+      "company": "DevITjobs",
+      "location": null,
+      "source_url": "https://devitjobs.com/jobs/Python/all/all",
+      "fit_score": 71.0,
+      "decision": "notify",
+      "applied": false,
+      "resume_generated": false,
+      "discovered_at": "2026-04-18T11:24:18.098299"
+    }
+  ]
+}
+```
+
+**Job summary fields:**
+
+| Field | Type | Notes |
+|---|---|---|
+| `job_id` | string | MD5 hash — use as React key and to fetch detail |
+| `title` | string or null | Job title from the career page |
+| `company` | string or null | Company name |
+| `location` | string or null | Can be null — show "Not specified" |
+| `source_url` | string or null | Original URL of the job posting |
+| `fit_score` | number or null | 0–100 AI score |
+| `decision` | string | `"auto_apply"`, `"notify"`, or `"rejected"` |
+| `applied` | boolean | Always `false` for now (manual tracking not implemented) |
+| `resume_generated` | boolean | `true` if Agent 4 generated a PDF resume |
+| `discovered_at` | string | ISO 8601 timestamp |
+
+**Filter in React (recommended — show tabs by decision):**
+
+```js
+const autoApply = data.jobs.filter(j => j.decision === "auto_apply");
+const notify    = data.jobs.filter(j => j.decision === "notify");
+const rejected  = data.jobs.filter(j => j.decision === "rejected");
+```
+
+---
+
+### 6.2 Job Detail
+
+**`GET /api/agents/dashboard/jobs/<job_id>/`** — Requires JWT.
+
+Returns the full detail for a single job — every field from both the job listing and the application record. Call this when the user clicks a job card.
+
+```js
+const res = await apiFetch(`/api/agents/dashboard/jobs/${jobId}/`);
+const job = await res.json();
+```
+
+**Success — HTTP 200 (all 25 fields):**
+```json
+{
+  "job_id": "459f578a8bec3e742837e253d6a03cbc",
+  "title": "1317 Python Developer jobs in the US",
+  "company": "DevITjobs",
+  "location": null,
+  "source_url": "https://devitjobs.com/jobs/Python/all/all",
+  "apply_link": "https://devitjobs.com/jobs/Python/all/all",
+  "description": "Full job description text...",
+  "requirements": [],
+  "nice_to_have": [],
+  "job_type": null,
+  "remote_type": null,
+  "salary_info": null,
+  "company_info": { "name": "DevITjobs" },
+  "fit_score": 71.0,
+  "score_breakdown": {
+    "skills_match": 50.0,
+    "experience_match": 70.0,
+    "preference_match": 100.0,
+    "overall_score": 71.0
+  },
+  "matching_skills": [],
+  "missing_skills": [],
+  "decision": "notify",
+  "decision_reason": "Moderate fit (71.0) — worth reviewing",
+  "resume_generated": false,
+  "resume_path": null,
+  "resume_download_url": null,
+  "applied": false,
+  "applied_at": null,
+  "discovered_at": "2026-04-18T11:24:18.098299"
+}
+```
+
+**All fields:**
+
+| Field | Type | Notes |
+|---|---|---|
+| `job_id` | string | Use for resume download URL |
+| `title` | string or null | Job title |
+| `company` | string or null | Company name |
+| `location` | string or null | |
+| `source_url` | string or null | Original job posting URL |
+| `apply_link` | string or null | Direct application URL. Use first; fall back to `source_url` |
+| `description` | string or null | Full job description. Can be long — use truncate/expand |
+| `requirements` | array | List of requirement strings. May be empty `[]` |
+| `nice_to_have` | array | Nice-to-have strings. May be empty `[]` |
+| `job_type` | string or null | `"full_time"`, `"part_time"`, `"contract"`, `"internship"` |
+| `remote_type` | string or null | `"remote"`, `"hybrid"`, `"on_site"` |
+| `salary_info` | object or null | `{min_salary, max_salary, currency, period}` |
+| `company_info` | object or null | `{name, domain, size, industry, description}` |
+| `fit_score` | number or null | 0–100 overall score |
+| `score_breakdown` | object or null | `{skills_match, experience_match, preference_match, overall_score}` |
+| `matching_skills` | array | Skills the user has that match the job |
+| `missing_skills` | array | Skills the job requires that the user lacks |
+| `decision` | string | `"auto_apply"`, `"notify"`, or `"rejected"` |
+| `decision_reason` | string or null | Human-readable explanation of the decision |
+| `resume_generated` | boolean | Whether Agent 4 generated a PDF |
+| `resume_path` | string or null | Internal server path (not a URL — don't use directly) |
+| `resume_download_url` | string or null | `/api/agents/dashboard/jobs/<job_id>/resume/` — only non-null when `resume_generated=true` |
+| `applied` | boolean | Manual application tracking — always `false` for now |
+| `applied_at` | string or null | |
+| `discovered_at` | string or null | ISO 8601 |
+
+**Error — HTTP 404:**
+```json
+{ "error": "Job not found" }
+```
+
+---
+
+### 6.3 Download Resume PDF
+
+**`GET /api/agents/dashboard/jobs/<job_id>/resume/`** — Requires JWT.
+
+Downloads the AI-generated tailored PDF resume for this job. Only works when `resume_generated=true` for the job.
+
+Check `resume_download_url` in the job detail — if it's non-null, the download endpoint exists.
+
+```js
+async function downloadResume(jobId) {
+  const res = await fetch(
+    `${import.meta.env.VITE_API_BASE_URL}/api/agents/dashboard/jobs/${jobId}/resume/`,
+    {
+      headers: {
+        Authorization: `Bearer ${localStorage.getItem("access_token")}`,
+      },
+    }
+  );
+
+  if (!res.ok) {
+    alert("Resume not available for this job.");
+    return;
+  }
+
+  // Trigger browser download
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `resume_${jobId}.pdf`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+```
+
+**Success — HTTP 200:** Binary PDF file with headers:
+```
+Content-Type: application/pdf
+Content-Disposition: attachment; filename="resume_<job_id>.pdf"
+```
+
+**Error — HTTP 404:**
+```json
+{ "error": "No resume generated for this job" }
+```
+
+> Only show the download button when `job.resume_generated === true` (from the list endpoint) or `job.resume_download_url !== null` (from the detail endpoint). Never show it for `notify` or `rejected` jobs — resumes are only generated for `auto_apply` jobs (score ≥ 80).
+
+---
+
+### 6.4 What to Display Per Job Card
+
+**List card (from `/dashboard/jobs/`):**
+
+| UI Element | Field | Notes |
+|---|---|---|
+| Job title | `title` | |
+| Company | `company` | |
+| Location | `location` | Show "Not specified" if null |
+| Score badge | `fit_score` | Number, one decimal. Color: ≥80 green, 60-79 yellow, <60 red |
+| Decision badge | `decision` | See labels below |
+| Resume badge | `resume_generated` | Show "Resume Ready" chip if true |
+| Discovered date | `discovered_at` | Show as relative time "2 hours ago" |
+
+**Detail view (from `/dashboard/jobs/<id>/`):**
+
+| UI Element | Field | Notes |
+|---|---|---|
+| Score breakdown chart | `score_breakdown` | 4 values: skills_match, experience_match, preference_match, overall_score |
+| Matching skills chips | `matching_skills` | Green chips — skills user has |
+| Missing skills chips | `missing_skills` | Red chips — skills to learn |
+| Decision reason | `decision_reason` | Plain text explanation |
+| Full description | `description` | Long text — truncate to 3 lines, expand on click |
+| Requirements list | `requirements` | Bulleted list |
+| Nice to have | `nice_to_have` | Bulleted list, secondary style |
+| Job type | `job_type` | Use `jobTypeLabel()` below |
+| Remote type | `remote_type` | Use `remoteTypeLabel()` below |
+| Salary | `salary_info` | Use `formatSalary()` below |
+| Apply button | `apply_link` → `source_url` | Use apply_link first, fallback to source_url |
+| Download resume | `resume_download_url` | Only show button if non-null |
+
+**Decision badge labels and colors:**
+
+```js
+function decisionBadge(decision) {
+  switch (decision) {
+    case "auto_apply": return { label: "Resume Generated ✓", color: "green" };
+    case "notify":     return { label: "Good Match",         color: "yellow" };
+    case "rejected":   return { label: "Low Match",          color: "red" };
+    default:           return { label: decision,             color: "gray" };
+  }
+}
+```
+
+**Score color:**
+```js
+function scoreColor(score) {
+  if (score >= 80) return "green";
+  if (score >= 60) return "yellow";
+  return "red";
+}
+```
+
+**Job type label:**
+```js
+function jobTypeLabel(jobType) {
+  const map = { full_time: "Full Time", part_time: "Part Time", contract: "Contract", internship: "Internship" };
+  return jobType ? map[jobType] : null;
+}
+```
+
+**Remote type label:**
+```js
+function remoteTypeLabel(remoteType) {
+  const map = { remote: "Remote", hybrid: "Hybrid", on_site: "On-Site" };
+  return remoteType ? map[remoteType] : null;
+}
+```
+
+**Salary formatter:**
+```js
+function formatSalary(salaryInfo) {
+  if (!salaryInfo) return null;
+  const { min_salary, max_salary, currency, period } = salaryInfo;
+  if (min_salary && max_salary)
+    return `${currency} ${min_salary.toLocaleString()} – ${max_salary.toLocaleString()} / ${period}`;
+  if (min_salary)
+    return `${currency} ${min_salary.toLocaleString()}+ / ${period}`;
+  return null;
+}
+```
+
+**Apply button:**
+```js
+function getApplyUrl(job) {
+  return job.apply_link || job.source_url;
+}
+// Always open in new tab
+window.open(getApplyUrl(job), "_blank");
+```
+
+---
+
+### 6.5 Full Dashboard React Example
+
+```jsx
+import { useState, useEffect } from "react";
+import { apiFetch } from "../api/client";
+
+export function Dashboard() {
+  const [jobs, setJobs]             = useState([]);
+  const [count, setCount]           = useState(0);
+  const [loading, setLoading]       = useState(true);
+  const [activeTab, setActiveTab]   = useState("auto_apply");
+  const [selectedJob, setSelectedJob] = useState(null);
+  const [detail, setDetail]         = useState(null);
+
+  // Load jobs on mount
+  useEffect(() => {
+    loadJobs();
+  }, []);
+
+  async function loadJobs() {
+    setLoading(true);
+    const res = await apiFetch("/api/agents/dashboard/jobs/");
+    const data = await res.json();
+    setJobs(data.jobs);
+    setCount(data.count);
+    setLoading(false);
+  }
+
+  async function openJobDetail(jobId) {
+    setSelectedJob(jobId);
+    setDetail(null);
+    const res = await apiFetch(`/api/agents/dashboard/jobs/${jobId}/`);
+    const data = await res.json();
+    setDetail(data);
+  }
+
+  async function downloadResume(jobId) {
+    const res = await fetch(
+      `${import.meta.env.VITE_API_BASE_URL}/api/agents/dashboard/jobs/${jobId}/resume/`,
+      { headers: { Authorization: `Bearer ${localStorage.getItem("access_token")}` } }
+    );
+    if (!res.ok) { alert("Resume not available."); return; }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `resume_${jobId}.pdf`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const tabJobs = jobs.filter(j => j.decision === activeTab);
+
+  if (loading) return <p>Loading jobs...</p>;
+
+  return (
+    <div>
+      <h2>Jobs Found ({count})</h2>
+
+      {/* Tab bar */}
+      <div>
+        {["auto_apply", "notify", "rejected"].map(tab => (
+          <button key={tab} onClick={() => setActiveTab(tab)}
+            style={{ fontWeight: activeTab === tab ? "bold" : "normal" }}>
+            {tab === "auto_apply" ? `Resume Ready (${jobs.filter(j=>j.decision==="auto_apply").length})`
+              : tab === "notify"  ? `Good Matches (${jobs.filter(j=>j.decision==="notify").length})`
+              : `Low Matches (${jobs.filter(j=>j.decision==="rejected").length})`}
+          </button>
+        ))}
+      </div>
+
+      {/* Job list */}
+      {tabJobs.map(job => (
+        <div key={job.job_id} onClick={() => openJobDetail(job.job_id)}
+          style={{ cursor: "pointer", border: "1px solid #ccc", margin: 8, padding: 12 }}>
+          <strong>{job.title || "Untitled"}</strong>
+          <p>{job.company} · {job.location || "Not specified"}</p>
+          <p>Score: {job.fit_score ?? "—"} · {job.decision}</p>
+          {job.resume_generated && <span>✓ Resume Ready</span>}
+        </div>
+      ))}
+
+      {/* Job detail panel */}
+      {selectedJob && detail && (
+        <div style={{ position: "fixed", right: 0, top: 0, width: 400, height: "100%",
+          background: "white", boxShadow: "-2px 0 8px rgba(0,0,0,0.1)", padding: 16, overflow: "auto" }}>
+          <button onClick={() => setSelectedJob(null)}>✕ Close</button>
+
+          <h3>{detail.title}</h3>
+          <p>{detail.company} · {detail.location || "Not specified"}</p>
+          <p>Score: {detail.fit_score} — {detail.decision_reason}</p>
+
+          {/* Score breakdown */}
+          {detail.score_breakdown && (
+            <div>
+              <p>Skills match: {detail.score_breakdown.skills_match}%</p>
+              <p>Experience: {detail.score_breakdown.experience_match}%</p>
+              <p>Preferences: {detail.score_breakdown.preference_match}%</p>
+            </div>
+          )}
+
+          {/* Matching / missing skills */}
+          {detail.matching_skills?.length > 0 && (
+            <p>✅ Matching: {detail.matching_skills.join(", ")}</p>
+          )}
+          {detail.missing_skills?.length > 0 && (
+            <p>❌ Missing: {detail.missing_skills.join(", ")}</p>
+          )}
+
+          {/* Action buttons */}
+          <a href={detail.apply_link || detail.source_url} target="_blank" rel="noreferrer">
+            Apply Now ↗
+          </a>
+
+          {detail.resume_download_url && (
+            <button onClick={() => downloadResume(detail.job_id)}>
+              Download Resume PDF
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+---
+
+## 7. SmartApply Pipeline (Legacy Direct Trigger)
+
+### 7.1 How It Works
 
 ```
 User enables the "SmartApply" toggle
@@ -1929,4 +2650,3 @@ All endpoints are on `https://smartapply-7msy.onrender.com`
 12. **`resume_url` is a server-side file path, not a public URL** — you cannot link to it directly. Show "Resume Ready" as a badge. The download button should be disabled / hidden until a download endpoint is added to the backend.
 
 13. **Render free tier cold starts** — both services may take 30–60 seconds to respond after being idle. On the first request of the day, show a "Waking up service..." message if response takes more than 10 seconds.
-](https://github.com/naveensomalapuri/React_Integration/blob/main/REACT_INTEGRATION.md)
