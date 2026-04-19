@@ -1,4 +1,4 @@
-# SmartApply — React Frontend Integration Guide
+[# SmartApply — React Frontend Integration Guide
 
 > **For the React / frontend developer.**
 > This document covers every API endpoint, exact request and response shapes verified directly from the source code, the toggle-button pipeline flow, job card display logic, error handling patterns, and environment setup.
@@ -1929,3 +1929,4 @@ All endpoints are on `https://smartapply-7msy.onrender.com`
 12. **`resume_url` is a server-side file path, not a public URL** — you cannot link to it directly. Show "Resume Ready" as a badge. The download button should be disabled / hidden until a download endpoint is added to the backend.
 
 13. **Render free tier cold starts** — both services may take 30–60 seconds to respond after being idle. On the first request of the day, show a "Waking up service..." message if response takes more than 10 seconds.
+](https://github.com/naveensomalapuri/React_Integration/blob/main/REACT_INTEGRATION.md)
